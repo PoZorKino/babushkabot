@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import InputRichMessage, Message
 
 from . import config
 from .llm import LLMError, stream_reply
@@ -20,6 +20,7 @@ log = logging.getLogger("babushka")
 DRAFT_INTERVAL = 0.35
 EDIT_INTERVAL = 1.0  # Telegram режет правки чаще ~1/сек на чат
 LIMIT = 3800  # запас до 4096 на теги и курсор
+RICH_LIMIT = 30000  # у rich-сообщений лимит 32768
 CURSOR = " ▌"
 
 history: dict[int, deque] = defaultdict(lambda: deque(maxlen=config.HISTORY_LIMIT))
@@ -54,6 +55,9 @@ class Streamer:
     def __init__(self, source: Message) -> None:
         self.source = source
         self.use_draft = source.chat.type == "private"
+        # rich-сообщения (Bot API 10.2) понимают Markdown сами, включая таблицы
+        self.rich = self.use_draft
+        self.limit = RICH_LIMIT if self.rich else LIMIT
         self.draft_id = random.randint(1, 2**31 - 1)
         self.msg: Message | None = None
         self.offset = 0  # сколько символов уже ушло в предыдущие сообщения
@@ -64,6 +68,12 @@ class Streamer:
 
     async def _draft(self, text: str) -> None:
         bot, chat = self.source.bot, self.source.chat.id
+        if self.rich:
+            try:
+                await bot.send_rich_message_draft(chat, self.draft_id, InputRichMessage(markdown=text))
+                return
+            except TelegramBadRequest as e:
+                log.warning("rich draft rejected: %s", e)  # недописанная разметка - пробуем обычный драфт
         try:
             await bot.send_message_draft(chat, self.draft_id, text=to_telegram_html(text), parse_mode="HTML")
         except TelegramBadRequest:
@@ -84,6 +94,16 @@ class Streamer:
             self.last_draft = text
             self.last_edit = time.monotonic()
             return
+
+        if self.rich and final:
+            try:
+                await self.source.bot.send_rich_message(self.source.chat.id, InputRichMessage(markdown=text))
+                self.last_draft = ""
+                return
+            except TelegramBadRequest as e:
+                log.warning("rich message rejected, fallback to html: %s", e)
+                self.rich = False
+                self.limit = LIMIT
 
         body = to_telegram_html(text) + ("" if final else CURSOR)
         if body == self.last_sent:
@@ -117,10 +137,10 @@ class Streamer:
         if time.monotonic() - self.last_edit < self.interval:
             return
         # слишком длинно: закрываем текущее сообщение на границе строки и начинаем новое
-        while len(full) - self.offset > LIMIT:
-            chunk = full[self.offset : self.offset + LIMIT]
+        while len(full) - self.offset > self.limit:
+            chunk = full[self.offset : self.offset + self.limit]
             cut = chunk.rfind("\n")
-            cut = cut if cut > LIMIT // 2 else LIMIT
+            cut = cut if cut > self.limit // 2 else self.limit
             await self._send(full[self.offset : self.offset + cut], final=True)
             self.offset += cut
             self.msg, self.last_sent = None, ""
