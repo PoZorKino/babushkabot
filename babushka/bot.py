@@ -1,19 +1,21 @@
 import asyncio
+import json
 import logging
 import random
 import time
+from pathlib import Path
 from collections import defaultdict, deque
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InputRichMessage, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputRichMessage, Message
 
 from . import config
 from .llm import LLMError, stream_reply
 from .mdhtml import to_telegram_html
-from .persona import SYSTEM_PROMPT
+from .persona import DEFAULT_PERSONA, PERSONAS
 
 log = logging.getLogger("babushka")
 
@@ -29,13 +31,69 @@ busy: set[int] = set()
 dp = Dispatcher()
 
 
+STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "personas.json"
+
+
+def _load_personas() -> dict[int, str]:
+    try:
+        return {int(k): v for k, v in json.loads(STATE_FILE.read_text("utf-8")).items() if v in PERSONAS}
+    except (OSError, ValueError):
+        return {}
+
+
+chat_persona: dict[int, str] = _load_personas()
+
+
+def _save_personas() -> None:
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(chat_persona), "utf-8")
+
+
+def current_persona(chat: int) -> str:
+    return chat_persona.get(chat, DEFAULT_PERSONA)
+
+
+def persona_keyboard(current: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=("✓ " if key == current else "") + name, callback_data=f"persona:{key}")
+                for key, (name, _, _) in PERSONAS.items()
+            ]
+        ]
+    )
+
+
 @dp.message(CommandStart())
 async def start(m: Message) -> None:
+    cur = current_persona(m.chat.id)
     await m.answer(
-        "Ой, здравствуй, внучок! Это баба Валя. Спрашивай что хочешь - "
-        "про борщ, про здоровье, про эти ваши компьютеры... Подскажу, как смогу.\n\n"
-        "/reset - забыть наш разговор"
+        PERSONAS[cur][1] + "\n\n/persona - сменить бабушку\n/reset - забыть разговор",
+        reply_markup=persona_keyboard(cur),
     )
+
+
+@dp.message(Command("persona"))
+async def persona(m: Message) -> None:
+    await m.answer("Кого позвать?", reply_markup=persona_keyboard(current_persona(m.chat.id)))
+
+
+@dp.callback_query(F.data.startswith("persona:"))
+async def pick_persona(q: CallbackQuery) -> None:
+    key = q.data.split(":", 1)[1]
+    if key not in PERSONAS or q.message is None:
+        await q.answer()
+        return
+    chat = q.message.chat.id
+    if key != current_persona(chat):
+        chat_persona[chat] = key
+        _save_personas()
+        history.pop(chat, None)  # чтобы стиль прошлой бабки не просачивался
+    await q.answer(PERSONAS[key][0])
+    try:
+        await q.message.edit_text(PERSONAS[key][1], reply_markup=persona_keyboard(key))
+    except TelegramBadRequest:
+        pass
 
 
 @dp.message(Command("reset"))
@@ -164,7 +222,7 @@ async def talk(m: Message, bot: Bot) -> None:
     busy.add(chat)
     try:
         history[chat].append({"role": "user", "content": m.text})
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history[chat]]
+        messages = [{"role": "system", "content": PERSONAS[current_persona(chat)][2]}, *history[chat]]
         streamer = Streamer(m)
         full = ""
         await bot.send_chat_action(chat, "typing")
