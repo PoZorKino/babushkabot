@@ -19,6 +19,59 @@ _QUOTE = re.compile(r"^&gt;[ \t]?")
 _HR = re.compile(r"^[ \t]*([-*_])([ \t]*\1){2,}[ \t]*$")
 
 
+_TABLE_ROW = re.compile(r"^[ \t]*\|.*$")
+_TABLE_SEP = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(\|[ \t]*:?-{2,}:?[ \t]*)*\|?[ \t]*$")
+TABLE_MAX_WIDTH = 42  # шире - на телефоне в <pre> начнёт переноситься
+
+
+def _plain(cell: str) -> str:
+    cell = _LINK.sub(r"\1", cell)
+    cell = re.sub(r"(\*\*|__|~~|`)", "", cell)
+    return cell.strip()
+
+
+def _cells(line: str) -> list[str]:
+    return [_plain(c) for c in line.strip().strip("|").split("|")]
+
+
+def _render_table(rows: list[list[str]]) -> str:
+    """Telegram не умеет таблицы: узкие рисуем в <pre>, широкие - карточками."""
+    head, body = rows[0], rows[1:]
+    cols = len(head)
+    body = [(r + [""] * cols)[:cols] for r in body]
+    widths = [max(len(r[i]) for r in [head] + body) for i in range(cols)]
+    if sum(widths) + 3 * (cols - 1) <= TABLE_MAX_WIDTH:
+        def line(r: list[str]) -> str:
+            return " │ ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip()
+        rule = "─┼─".join("─" * w for w in widths)
+        text = "\n".join([line(head), rule, *map(line, body)])
+        return "<pre>" + html.escape(text, quote=False) + "</pre>"
+    cards = []
+    for r in body:
+        lines = [f"<b>{html.escape(r[0], quote=False)}</b>"]
+        for h, c in zip(head[1:], r[1:]):
+            if c:
+                lines.append(f"{html.escape(h, quote=False)}: {html.escape(c, quote=False)}")
+        cards.append("\n".join(lines))
+    return "\n\n".join(cards)
+
+
+def _tables(md: str, keep) -> str:
+    lines, out, i = md.split("\n"), [], 0
+    while i < len(lines):
+        if _TABLE_ROW.match(lines[i]) and i + 1 < len(lines) and _TABLE_SEP.match(lines[i + 1]):
+            j = i + 2
+            while j < len(lines) and _TABLE_ROW.match(lines[j]):
+                j += 1
+            rows = [_cells(lines[i])] + [_cells(l) for l in lines[i + 2 : j]]
+            out.append(keep(_render_table(rows)))
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
 def _inline(text: str) -> str:
     text = _LINK.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
     text = _BOLD.sub(r"<b>\2</b>", text)
@@ -44,6 +97,7 @@ def to_telegram_html(md: str) -> str:
 
     md = md.replace("\x00", "")
     md = _FENCE.sub(fence, md)
+    md = _tables(md, keep)
     md = _INLINE_CODE.sub(lambda m: keep(f"<code>{html.escape(m.group(1), quote=False)}</code>"), md)
     md = html.escape(md, quote=False)
 
